@@ -1,0 +1,7 @@
+# Alternative to the local Jaeger binary, for machines with Docker.
+services:
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP/HTTP (the SDK exports here)
