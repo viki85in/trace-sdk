@@ -17,4 +17,6 @@ A lightweight, annotation-only tracing SDK for Spring Boot 3.x applications, exp
 
 To see traces in Jaeger and try the failure modes, follow [demo/README.md](demo/README.md).
 
+Benchmarks at the spec's standard volumes (avg/p90/p95/p99): [bench/README.md](bench/README.md).
+
 See the specification for requirements, design decisions and the Gherkin test cases.

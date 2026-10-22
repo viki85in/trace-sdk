@@ -2,12 +2,17 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.7 |
-| **Date** | 2026-10-20 |
+| **Status** | Draft v0.8 |
+| **Date** | 2026-10-22 |
 | **Owner** | Vikram Subramanian |
 | **Repository** | Standalone repository (not part of any application monorepo) |
 | **Target** | Spring applications only in v1: Spring Framework 6.x / Spring Boot 3.x (see D-1) |
 | **Scope** | Publishing side only (in-process SDK + export). Storage, indexing, and query belong to a separate downstream service. |
+
+**Changes in v0.8:**
+- New §10.7 (standard volumes and load profiles), §10.8 (benchmark method) and §10.9 (first results). The macro benchmark lives in `bench/` and reports avg, p50, p90, p95, p99, p99.9 and max per execution at tiers derived from NFR-4.1.
+- NFR-4.1 gains a note that the cost points to sampling, with an optional `all` mode. D-1 Option B cons are expanded and §13.3 records why the proxy limits are acceptable.
+- Requirements in §2–§11 are unchanged. The first results exceed two NFR-1 targets (throughput loss, exporter CPU); see §10.9.
 
 **Changes in v0.7:**
 - New §14 Test Cases: failure-mode and configuration scenarios in Gherkin, grouped by category, each with its test status (automated / manual / not tested) and result. Requirements in §2–§11 are unchanged.
@@ -668,6 +673,73 @@ A reconstruction harness rebuilds each trace from exported records and compares 
 
 ### 10.6 Exit criteria
 S4 at `L1` meets every NFR-1 target and scores 100% on reconstruction when the pipeline is healthy.
+
+### 10.7 Standard volumes and load profiles
+
+The macro benchmark (`bench/`) drives a synthetic application at volumes derived from the NFR-4.1 cost model. A **tier** says how much of the fleet's volume lands on one JVM; a **load level** says how far above the daily average the traffic is.
+
+| Tier | Hosts sharing the volume | Executions/s per JVM at average load | Meaning |
+|---|---|---|---|
+| standard | 1,000 (the NFR-4.1 `H`) | 11.6 | A typical host |
+| dense | 100 | 115.7 | A well-used service tier |
+| hot | 10 | 1,157 | A concentrated tier (≈ 11.6K spans/s at L1) |
+| extreme | 1 | 11,574 | The whole fleet's volume through one JVM; a stress case, not an expectation |
+
+| Load level | Multiple of average | Basis |
+|---|---|---|
+| avg | 1.0× | `E` = 10⁹ executions/day ÷ 86,400 s |
+| p90 | 2.0× | **Assumed** |
+| p95 | 2.5× | **Assumed** |
+| p99 | 3.0× | The NFR-4.1 peak-to-average ratio `P` |
+
+The p90 and p95 multipliers are placeholders; replace them with measured traffic percentiles as soon as production data exists. Results are reported for each (tier, load level) cell as **avg, p50, p90, p95, p99, p99.9 and max latency per execution**, measured from the intended start time of each execution (open loop, so queuing behind a stall is not hidden), next to the S0 baseline for the same cell. Each run also reports allocation per execution, GC count and time, process CPU, exporter-thread CPU, spans started/exported/dropped, and wire bytes per span.
+
+Workloads: `api` (10 spans at L1, 2 step events at L2), `api-fail` (the same with 10% failures), `bulk` (500 records in 50-record chunks), `chain` (depth 10). Strategies: S0, S1, and the SDK at L0, L1 and L2. A closed-loop saturation run reports maximum throughput per strategy.
+
+Caveats: the application work in each span is a fixed 5 µs spin, so percentage overhead scales with it; the sink is a local no-op collector; synthetic spans compress better than real ones, so wire bytes per span is a lower bound.
+
+### 10.8 Benchmark method
+
+- **Harness:** `bench/` (standalone Maven project). `suite` starts a sink process and then one fresh JVM per run (2 GB heap, pre-touched); `run` executes a single cell; `sink` is a no-op OTLP/HTTP collector that counts requests and bytes.
+- **Open loop:** executions are scheduled at fixed intended start times across 8 load threads, and latency is recorded (HdrHistogram, ns) from the intended start. Rate 0 is closed loop and measures saturation throughput.
+- **Phases:** 8 s warm-up (half closed loop for JIT, half at the target rate), drain of the exporter, then 20 s measured. Span accounting is read after a second drain, so started = exported + dropped.
+- **Recorded per run:** latency distribution, achieved rate, allocation per execution (`ThreadMXBean`), GC count and time, process CPU, exporter-thread CPU, spans started/exported/dropped, sink requests and bytes.
+- **Matrix (45 runs):** dense and hot tiers × {avg, p90, p95, p99} × {S0, S1, L1}; standard and extreme × {avg, p99} × {S0, L1}; L0 and L2 at hot/p99; bulk, chain and api-fail at hot/p99 × {S0, L1}; saturation × {S0, S1, L0, L1, L2}. A one-minute smoke profile runs S0 and L1 at dense/avg.
+- **Application work:** each synthetic call spins 5 µs (`bench.work.ns`). Overhead as a percentage depends on this; absolute microsecond deltas are the portable figure.
+- **Limits:** the host was shared (load average about 6), runs are single-shot, and below saturation thread wake-up jitter dominates latency (S0 averages 100–130 µs for about 60 µs of work), so low-rate Δ values are noisy. Repeat on a quiet machine, interleaved, ≥ 30 iterations (§10.3) before treating a delta as a finding.
+
+### 10.9 First results (2026-10-22)
+
+Environment: 36-core Linux host, JDK 21, local sink. Full tables are in `bench/results/2026-10-22-full/report.md`.
+
+**Saturation (closed loop, `api`, 10 spans per execution):**
+
+| Strategy | Executions/s | vs S0 | Added per execution |
+|---|---|---|---|
+| S0 | 150.8K | | |
+| S1 (`trace.enabled=false`) | 147.8K | −2.0% | 1.1 µs avg, 1.3 µs p99 |
+| L0 | 144.7K | −4.1% | 2.2 µs |
+| L1 | 141.4K | −6.3% | 3.5 µs avg, 4.5 µs p99 |
+| L2 | 141.1K | −6.4% | 3.6 µs |
+
+**Against NFR-1:**
+
+| Target | Result | Status |
+|---|---|---|
+| Throughput reduction at L1 ≤ 3% | 6.3% in a worst case where the application does nothing but spin | **Not met** (re-test with a realistic workload) |
+| Per span at L1 ≤ 1.5 µs p50, ≤ 5 µs p99 | ≈ 0.35 µs avg, 4.5 µs p99 per execution (10 spans) | Met |
+| Disabled path ≤ 200 ns per call | 1.1 µs per execution of 12 calls ≈ 90 ns per call | Met (provisional) |
+| Allocation ≤ 256 B per span | ≈ 166 B SDK share (2,879 B per execution; 1,215 B is Spring's proxy invocation) | Met |
+| Exporter CPU ≤ 2% of one core | ≈ 11 µs per span: 4.5% of a core at dense/p99 (3.5K spans/s), ≈ 40% at hot/p99 (35K spans/s) | **Not met** |
+| ≤ 300 B per span on the wire | ≈ 36 B, from near-identical synthetic spans | Not conclusive |
+
+**Volume:**
+- No drops at standard, dense or hot, including p99.
+- At the extreme tier, average load (116K spans/s) is exported with no drops. At p99 (347K spans/s into one JVM), about 49% of spans are dropped at the full buffer: one exporter thread sustains about 175K spans/s. Drops are counted and the application is unaffected (NFR behaviour as specified).
+- Level cost: at hot/p99, L0 adds 43.8 µs, L1 49.2 µs and L2 16.8 µs on average, which is within the noise of that cell; use the saturation rows for level comparison.
+- Workloads `bulk`, `chain` and `api-fail` show no drops at hot/p99.
+
+**Follow-ups:** define the reference load for the exporter-CPU target; test a faster or parallel exporter and cheaper encoding if the target stands; add the L2 and sampling cost to the table once sampling exists; repeat on a quiet host.
 
 ---
 
