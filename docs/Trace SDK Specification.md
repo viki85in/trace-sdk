@@ -2,12 +2,16 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.8 |
+| **Status** | Draft v0.9 |
 | **Date** | 2026-10-22 |
 | **Owner** | Vikram Subramanian |
 | **Repository** | Standalone repository (not part of any application monorepo) |
 | **Target** | Spring applications only in v1: Spring Framework 6.x / Spring Boot 3.x (see D-1) |
 | **Scope** | Publishing side only (in-process SDK + export). Storage, indexing, and query belong to a separate downstream service. |
+
+**Changes in v0.9:**
+- New §15 Wire Size Optimization Options: where the bytes go in a span on the wire and four options for reducing them (trim within OTLP, per-trace constants, batch-level dictionary, custom compact format), with their cost to NFR-2. No option is adopted; §2–§11 are unchanged.
+- The ≤ 300 B/span target (NFR-1) stays a target to confirm. The §10.9 figure of ≈ 36 B/span is from near-identical synthetic spans and is a lower bound, so the options are to be ranked after measuring real spans.
 
 **Changes in v0.8:**
 - New §10.7 (standard volumes and load profiles), §10.8 (benchmark method) and §10.9 (first results). The macro benchmark lives in `bench/` and reports avg, p50, p90, p95, p99, p99.9 and max per execution at tiers derived from NFR-4.1.
@@ -1298,3 +1302,48 @@ Feature: The collector refuses to accept spans
 
 - Automated: `cd trace-sdk-demo && mvn test` (needs the SDK installed locally; takes about 30 seconds). Each test's display name starts with its scenario ID.
 - Manual (TC-M1): start Jaeger and the demo app, run `./run-demo.sh`, stop Jaeger and run it again, restart Jaeger and run it a third time. Wait for the old Jaeger process to exit before starting the new one (port 8888 is held until then).
+
+---
+
+## 15. Wire Size Optimization Options
+
+Options for sending fewer bytes per span. **None is adopted in v1**; this section records them so the choice can be made once real span sizes are measured. The target stays NFR-1 (≤ 300 B/span on the wire at `L1`). The §10.9 figure of ≈ 36 B/span comes from near-identical synthetic spans and is a lower bound, not evidence that the target is met.
+
+### 15.1 Where the bytes go
+
+Measured on one real demo trace (4 spans, OTLP/JSON, uncompressed, 4,993 B for the request):
+
+| Source | Why it costs bytes | Fixable? |
+|---|---|---|
+| Attribute keys | Each span repeats about 11 key strings (`tenant.id`, `code.namespace`, `retention.class`, …). In protobuf these are still strings; only the OTLP envelope loses its field names. | Yes: dictionary or per-trace constants |
+| Values equal on every span of a trace | `tenant.id`, `org.id`, `retention.class`, `trace.level`, `component`, often `code.namespace` and `thread.name` | Yes: send once |
+| Derivable values | `duration.ns` equals `endTimeUnixNano − startTimeUnixNano` | Yes: drop |
+| JSON wrapping | `{"key":…,"value":{"stringValue":…}}` per attribute | Not applicable to the default protobuf encoding |
+| IDs and timestamps | 16 B trace ID, 8 B span ID, 8 B parent ID, two 8 B timestamps per span | Largely no |
+
+gzip already compresses repeated keys within a batch of up to 512 spans, so the saving from each option is smaller on the wire than before compression. Measure after gzip.
+
+### 15.2 Options
+
+| # | Option | What changes | Expected effect | Cost |
+|---|---|---|---|---|
+| W-1 | **Trim within OTLP** | Drop `duration.ns` and per-span `thread.name`; omit attributes that carry no information at the chosen level | Small | A downstream consumer that reads `duration.ns` must compute it. Otherwise none; output stays plain OTLP. |
+| W-2 | **Per-trace constants at the resource level** | Put `tenant.id`, `org.id`, `retention.class`, `component` on the OTLP resource, or group spans into one `ResourceSpans` per tenant, so they are sent once per group | Medium | Plain OTLP, but a batch must be split per tenant/org (NFR-7 already forbids mixing tenants in a span). More resource groups per request. Collectors and backends must index resource attributes as they do span attributes. |
+| W-3 | **Batch-level key dictionary** | Replace attribute key strings with small integers defined once per batch (or once per connection, with a version) | Medium to large, mostly before gzip | **Not OTLP.** Needs a receiver or translator in front of the collector. |
+| W-4 | **Compact predefined format** | Both sides agree on a schema version (`tsdk.schema.version` is already sent). Spans carry values only, in fixed order or as columns (all span IDs, then all durations, …); `app.*` captures use the dictionary of W-3 | Large | **Not OTLP.** Custom receiver required; every schema change needs a coordinated SDK and receiver release; user-defined `app.*` keys still need dictionary entries. |
+
+### 15.3 Trade-off
+
+W-1 and W-2 keep the wire format valid OTLP, so NFR-2 (vendor-agnostic; changing the backend is a collector change) still holds. W-3 and W-4 give up NFR-2 for the stretch between the SDK and the receiver: a standard OTLP collector, Jaeger or an OTel backend cannot read the stream directly, and the translator becomes a component to build, run and size.
+
+### 15.4 Recommendation (for confirmation)
+
+1. Adopt W-1 and W-2 when convenient, since they cost nothing in compatibility.
+2. Measure bytes per span, after gzip, on realistic traffic (not the synthetic benchmark workload).
+3. Consider W-3 or W-4 only if measured bytes per span exceed the NFR-1 target, or if sizing at the NFR-4.1 volumes (≈ 3 TB/day on the wire at `L1`) makes transport cost material.
+
+### 15.5 Open points
+
+- Which attributes may be moved to the resource without changing how the backend indexes them (depends on §12 question 1, the first storage backend).
+- Whether the translator for W-3/W-4 is run as part of the collector tier or as a separate hop.
+- Whether `code.lineno` should be on the wire at all. The spec lists it as required (§6.2), but the demo trace did not contain it; check the SDK against §6.2 before sizing.
